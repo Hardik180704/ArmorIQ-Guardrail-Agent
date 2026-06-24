@@ -41,7 +41,7 @@ User → FastAPI → LangGraph Agent → Policy Engine → MCP Servers
 ### With Docker (Recommended)
 
 1. Clone the repo
-2. Copy `.env.example` to `.env` and fill in your API keys
+2. Copy `.env.sample` to `.env` and fill in your API keys
 3. Run:
 ```bash
 docker compose up --build
@@ -91,4 +91,4 @@ armoriq-assignment/
 ├── dashboard/           # Next.js frontend
 ├── docker-compose.yml
 ├── Dockerfile
-└── .env.example
+└── .env.sample
