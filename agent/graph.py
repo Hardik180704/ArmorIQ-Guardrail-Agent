@@ -163,13 +163,5 @@ async def run_agent(user_message: str):
     final_message = result["messages"][-1]
     return final_message.content
 
-if __name__ == "__main__":
-    
-    async def test():
-        response = await run_agent("Delete the record with key test")
-        print(f"\n✅ Final response: {response}")
-    
-    asyncio.run(test())
-
 
 
