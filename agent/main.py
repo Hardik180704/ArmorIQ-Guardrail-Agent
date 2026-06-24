@@ -53,6 +53,21 @@ async def chat(req: ChatRequest):
     conversation_id = req.conversation_id or str(uuid.uuid4())
     
     engine = PolicyEngine()
+    injection = engine._check_prompt_injection({"message": req.message})
+    if injection:
+        log_entry = {
+            "conversation_id": conversation_id,
+            "user_message": req.message,
+            "agent_response": f"🚫 Prompt injection blocked: '{injection}'",
+            "blocked": True
+        }
+        engine.redis.lpush("policy:logs", json.dumps(log_entry))
+        engine.redis.ltrim("policy:logs", 0, 99)
+        return {
+            "response": f"🚫 Prompt injection detected and blocked: '{injection}'",
+            "blocked": True,
+            "conversation_id": conversation_id
+        }
     
     # Load conversation history from Redis
     history_key = f"conversation:{conversation_id}:messages"

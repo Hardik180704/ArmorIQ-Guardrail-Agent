@@ -1,7 +1,7 @@
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from typing import TypedDict, Annotated
 from langgraph.graph.message import add_messages
 import os
@@ -45,9 +45,14 @@ def guardrail_node(state: AgentState):
     from policy.engine import PolicyEngine
     engine = PolicyEngine()
 
+    blocked_tool_messages = []
+    blocked_reason = ""
+    is_blocked = False
+
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"]
+        tool_id = tool_call.get("id")
 
         decision = engine.evaluate(
             tool_name = tool_name,
@@ -58,13 +63,29 @@ def guardrail_node(state: AgentState):
         print(f"🛡️ Tool '{tool_name}' → {decision.status}")
         
         if decision.status == "BLOCK":
-            return {
-                "blocked": True,
-                "block_reason": decision.reason,
-                "messages": state["messages"]
-            }
+            is_blocked = True
+            blocked_reason = decision.reason
+            blocked_tool_messages.append(ToolMessage(
+                content=f"Error: Action blocked by policy: {decision.reason}",
+                tool_call_id=tool_id
+            ))
+
+    if is_blocked:
+        # Provide block responses for all tool calls in the request to satisfy the API contract
+        for tool_call in last_message.tool_calls:
+            tool_id = tool_call.get("id")
+            if not any(tm.tool_call_id == tool_id for tm in blocked_tool_messages):
+                blocked_tool_messages.append(ToolMessage(
+                    content="Error: Execution skipped because another tool in the request was blocked by policy.",
+                    tool_call_id=tool_id
+                ))
+        return {
+            "blocked": True,
+            "block_reason": blocked_reason,
+            "messages": blocked_tool_messages
+        }
     
-    return {"blocked": False, "messages": state["messages"]}
+    return {"blocked": False, "messages": []}
 
 def blocked_node(state: AgentState):
     reason = state.get("block_reason", "Policy violation")
