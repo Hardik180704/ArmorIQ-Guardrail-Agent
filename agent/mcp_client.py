@@ -10,6 +10,7 @@ MCP_SERVERS = {
         "command": sys.executable,
         "args": ["mcp_server/server.py"],
         "transport": "stdio",
+        "env": os.environ.copy(),
     },
     "exa": {
         "url": f"https://mcp.exa.ai/mcp?exaApiKey={os.getenv('EXA_API_KEY')}",
