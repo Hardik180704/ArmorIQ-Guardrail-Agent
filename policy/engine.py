@@ -2,6 +2,8 @@ import redis
 import json
 import re
 import os
+import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
@@ -42,32 +44,36 @@ class PolicyEngine:
             if not rule.get("enabled", True):
                 continue
 
-            if rule["type"] == "block":
-                if rule["tool"] == tool_name or rule["tool"] == "*":
+            rule_type = rule.get("type")
+            rule_tool = rule.get("tool", "*")
+
+            if rule_type == "block":
+                if rule_tool == tool_name or rule_tool == "*":
                     return PolicyDecision(
                         status="BLOCK",
                         reason=rule.get("reason", f"Tool '{tool_name}' is blocked by policy")
                     )
 
-            if rule["type"] == "require_approval":
-                if rule["tool"] == tool_name:
+            if rule_type == "require_approval":
+                if rule_tool == tool_name or rule_tool == "*":
                     return PolicyDecision(
                         status="PENDING_APPROVAL",
                         reason=f"Tool '{tool_name}' requires human approval"
                     )
 
-            if rule["type"] == "input_validation":
-                if rule["tool"] == tool_name:
+            if rule_type == "input_validation":
+                if rule_tool == tool_name or rule_tool == "*":
                     decision = self._validate_input(tool_name, tool_args, rule)
                     if decision:
                         return decision
 
-            if rule["type"] == "budget":
-                tokens_used = context.get("tokens_used", 0)
-                if tokens_used > rule.get("max_tokens", 10000):
+            if rule_type == "budget":
+                tokens_used = self._coerce_int(context.get("tokens_used", 0), default=0)
+                max_tokens = self._coerce_int(rule.get("max_tokens"), default=10000)
+                if tokens_used > max_tokens:
                     return PolicyDecision(
                         status="BLOCK",
-                        reason=f"Token budget exceeded: {tokens_used} > {rule['max_tokens']}"
+                        reason=f"Token budget exceeded: {tokens_used} > {max_tokens}"
                     )
 
         return PolicyDecision(status="ALLOW")
@@ -79,22 +85,33 @@ class PolicyEngine:
 
         value = str(tool_args[field])
 
-        if "pattern" in rule:
-            if not re.match(rule["pattern"], value):
+        pattern = rule.get("pattern")
+        if pattern:
+            try:
+                matches_pattern = re.match(pattern, value)
+            except re.error as exc:
                 return PolicyDecision(
                     status="BLOCK",
-                    reason=f"Input validation failed: '{field}' value '{value}' doesn't match pattern '{rule['pattern']}'"
+                    reason=f"Input validation policy is invalid for '{field}': {exc}"
                 )
-
-        if "max_length" in rule:
-            if len(value) > rule["max_length"]:
+            if not matches_pattern:
                 return PolicyDecision(
                     status="BLOCK",
-                    reason=f"Input validation failed: '{field}' exceeds max length of {rule['max_length']}"
+                    reason=f"Input validation failed: '{field}' value '{value}' doesn't match pattern '{pattern}'"
                 )
 
-        if "blocked_keywords" in rule:
-            for keyword in rule["blocked_keywords"]:
+        max_length = rule.get("max_length")
+        if max_length is not None:
+            max_length = self._coerce_int(max_length, default=0)
+            if len(value) > max_length:
+                return PolicyDecision(
+                    status="BLOCK",
+                    reason=f"Input validation failed: '{field}' exceeds max length of {max_length}"
+                )
+
+        blocked_keywords = rule.get("blocked_keywords") or []
+        if blocked_keywords:
+            for keyword in blocked_keywords:
                 if keyword.lower() in value.lower():
                     return PolicyDecision(
                         status="BLOCK",
@@ -102,6 +119,71 @@ class PolicyEngine:
                     )
 
         return None
+
+    def _coerce_int(self, value, default: int) -> int:
+        try:
+            if value is None:
+                return default
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    # ---- APPROVAL MANAGEMENT ----
+
+    def create_pending_approval(
+        self,
+        conversation_id: str,
+        tool_call: dict,
+        reason: str,
+        user_message: str = "",
+    ) -> dict:
+        approval_id = str(uuid.uuid4())
+        record = {
+            "id": approval_id,
+            "status": "pending",
+            "conversation_id": conversation_id,
+            "tool_call": tool_call,
+            "reason": reason,
+            "user_message": user_message,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.redis.set(f"policy:approvals:{approval_id}", json.dumps(record))
+        self.redis.lpush("policy:approvals:index", approval_id)
+        self.redis.ltrim("policy:approvals:index", 0, 499)
+        return record
+
+    def get_approval(self, approval_id: str) -> dict | None:
+        raw = self.redis.get(f"policy:approvals:{approval_id}")
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    def list_approvals(self, status: str | None = None) -> list:
+        approvals = []
+        seen = set()
+        for approval_id in self.redis.lrange("policy:approvals:index", 0, -1):
+            if approval_id in seen:
+                continue
+            seen.add(approval_id)
+            approval = self.get_approval(approval_id)
+            if not approval:
+                continue
+            if status and approval.get("status") != status:
+                continue
+            approvals.append(approval)
+        return approvals
+
+    def update_approval(self, approval_id: str, updates: dict) -> dict | None:
+        approval = self.get_approval(approval_id)
+        if not approval:
+            return None
+        approval.update(updates)
+        approval["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.redis.set(f"policy:approvals:{approval_id}", json.dumps(approval))
+        return approval
 
     def _check_prompt_injection(self, tool_args: dict) -> str | None:
         INJECTION_PATTERNS = [

@@ -5,7 +5,7 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -23,6 +23,31 @@ from policy.engine import PolicyEngine
 # Global variables for compiled graph and tools
 graph = None
 tools = None
+
+async def ensure_tools_loaded():
+    global tools, graph
+    if tools is None:
+        tools = await get_mcp_tools()
+    if graph is None:
+        graph = build_graph(tools)
+    return tools
+
+def log_policy_event(engine: PolicyEngine, entry: dict):
+    engine.redis.lpush("policy:logs", json.dumps(entry))
+    engine.redis.ltrim("policy:logs", 0, 99)
+
+def append_conversation_message(engine: PolicyEngine, conversation_id: str, message: AIMessage):
+    history_key = f"conversation:{conversation_id}:messages"
+    history_raw = engine.redis.get(history_key)
+    messages_list = []
+    if history_raw:
+        try:
+            messages_list = messages_from_dict(json.loads(history_raw))
+        except Exception as e:
+            print(f"Error parsing history: {e}")
+    messages_list.append(message)
+    serialized_history = [message_to_dict(msg) for msg in messages_list]
+    engine.redis.set(history_key, json.dumps(serialized_history))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -61,17 +86,19 @@ async def chat(req: ChatRequest):
             "agent_response": f"🚫 Prompt injection blocked: '{injection}'",
             "blocked": True
         }
-        engine.redis.lpush("policy:logs", json.dumps(log_entry))
-        engine.redis.ltrim("policy:logs", 0, 99)
+        log_policy_event(engine, log_entry)
         return {
             "response": f"🚫 Prompt injection detected and blocked: '{injection}'",
             "blocked": True,
+            "policy_status": "BLOCK",
             "conversation_id": conversation_id
         }
     
     # Load conversation history from Redis
     history_key = f"conversation:{conversation_id}:messages"
+    tokens_key = f"conversation:{conversation_id}:tokens_used"
     history_raw = engine.redis.get(history_key)
+    tokens_used = engine._coerce_int(engine.redis.get(tokens_key), default=0)
     
     if history_raw:
         try:
@@ -87,44 +114,143 @@ async def chat(req: ChatRequest):
     messages_list.append(HumanMessage(content=req.message))
     
     # Run the graph
-    global graph
-    if not graph:
-        # Fallback if startup lifespan didn't run or completed with empty graph
-        tools = await get_mcp_tools()
-        graph = build_graph(tools)
+    await ensure_tools_loaded()
         
     result = await graph.ainvoke({
         "messages": messages_list,
-        "tokens_used": 0,
+        "tokens_used": tokens_used,
+        "conversation_id": conversation_id,
+        "policy_status": "ALLOW",
         "blocked": False,
-        "block_reason": ""
+        "block_reason": "",
+        "pending_approvals": [],
+        "pending_reason": "",
     })
     
     # The final message content
     final_message = result["messages"][-1]
     response_text = final_message.content
     is_blocked = result.get("blocked", False)
+    policy_status = result.get("policy_status", "ALLOW")
+    pending_approvals = result.get("pending_approvals", [])
     
     # Save the updated history to Redis
     updated_messages = result["messages"]
     serialized_history = [message_to_dict(msg) for msg in updated_messages]
     engine.redis.set(history_key, json.dumps(serialized_history))
+    engine.redis.set(tokens_key, int(result.get("tokens_used", tokens_used)))
     
     # Log to policy:logs for the dashboard UI
     log_entry = {
         "conversation_id": conversation_id,
         "user_message": req.message,
         "agent_response": response_text,
-        "blocked": is_blocked
+        "blocked": is_blocked,
+        "policy_status": policy_status,
+        "pending_approvals": pending_approvals,
     }
-    engine.redis.lpush("policy:logs", json.dumps(log_entry))
-    engine.redis.ltrim("policy:logs", 0, 99)
+    log_policy_event(engine, log_entry)
     
     return {
         "response": response_text,
         "blocked": is_blocked,
+        "policy_status": policy_status,
+        "pending_approvals": pending_approvals,
         "conversation_id": conversation_id
     }
+
+class ApprovalResolution(BaseModel):
+    reason: str = None
+
+@app.get("/approvals")
+def list_approvals(status: str = Query(default=None)):
+    engine = PolicyEngine()
+    return {"approvals": engine.list_approvals(status=status)}
+
+@app.get("/approvals/{approval_id}")
+def get_approval(approval_id: str):
+    engine = PolicyEngine()
+    approval = engine.get_approval(approval_id)
+    if not approval:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    return {"approval": approval}
+
+@app.post("/approvals/{approval_id}/approve")
+async def approve_approval(approval_id: str, req: ApprovalResolution = None):
+    engine = PolicyEngine()
+    approval = engine.get_approval(approval_id)
+    if not approval:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    if approval.get("status") != "pending":
+        raise HTTPException(status_code=409, detail=f"Approval is already {approval.get('status')}")
+
+    loaded_tools = await ensure_tools_loaded()
+    tool_call = approval.get("tool_call") or {}
+    tool_name = tool_call.get("name")
+    selected_tool = next((tool for tool in loaded_tools if tool.name == tool_name), None)
+    if not selected_tool:
+        raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
+
+    try:
+        tool_result = await selected_tool.ainvoke(tool_call.get("args") or {})
+    except Exception as exc:
+        updated = engine.update_approval(approval_id, {
+            "status": "failed",
+            "approved_reason": req.reason if req else None,
+            "error": str(exc),
+        })
+        raise HTTPException(status_code=500, detail=f"Approved tool execution failed: {exc}")
+
+    updated = engine.update_approval(approval_id, {
+        "status": "approved",
+        "approved_reason": req.reason if req else None,
+        "result": str(tool_result),
+    })
+    response_text = f"✅ Approved tool '{tool_name}' executed.\n\n{tool_result}"
+    append_conversation_message(
+        engine,
+        approval["conversation_id"],
+        AIMessage(content=response_text),
+    )
+    log_policy_event(engine, {
+        "conversation_id": approval["conversation_id"],
+        "user_message": approval.get("user_message", ""),
+        "agent_response": response_text,
+        "blocked": False,
+        "policy_status": "APPROVED",
+        "approval_id": approval_id,
+    })
+    return {"status": "approved", "approval": updated, "result": str(tool_result)}
+
+@app.post("/approvals/{approval_id}/reject")
+def reject_approval(approval_id: str, req: ApprovalResolution = None):
+    engine = PolicyEngine()
+    approval = engine.get_approval(approval_id)
+    if not approval:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    if approval.get("status") != "pending":
+        raise HTTPException(status_code=409, detail=f"Approval is already {approval.get('status')}")
+
+    updated = engine.update_approval(approval_id, {
+        "status": "rejected",
+        "rejection_reason": req.reason if req else None,
+    })
+    tool_name = (approval.get("tool_call") or {}).get("name", "tool")
+    response_text = f"🚫 Approval rejected for tool '{tool_name}'."
+    append_conversation_message(
+        engine,
+        approval["conversation_id"],
+        AIMessage(content=response_text),
+    )
+    log_policy_event(engine, {
+        "conversation_id": approval["conversation_id"],
+        "user_message": approval.get("user_message", ""),
+        "agent_response": response_text,
+        "blocked": True,
+        "policy_status": "REJECTED",
+        "approval_id": approval_id,
+    })
+    return {"status": "rejected", "approval": updated}
 
 class RuleModel(BaseModel):
     id: str = None
