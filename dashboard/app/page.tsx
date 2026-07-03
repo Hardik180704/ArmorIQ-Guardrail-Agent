@@ -1,12 +1,11 @@
 "use client"
 import { useState } from "react"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
-import { sendMessage, getRules, addRule, deleteRule, toggleRule, getLogs } from "@/lib/api"
+import { sendMessage, getRules, addRule, deleteRule, toggleRule, getLogs, getApprovals, approveApproval, rejectApproval } from "@/lib/api"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { Badge } from "@/components/ui/badge"
 import { Switch } from "@/components/ui/switch"
-import { Shield, MessageSquare, ScrollText, Trash2, Plus } from "lucide-react"
+import { Check, Shield, MessageSquare, ScrollText, Trash2, Plus, X } from "lucide-react"
 
 // ---- TYPES ----
 interface Message {
@@ -29,6 +28,20 @@ interface Log {
     user_message: string
     agent_response: string
     blocked: boolean
+}
+
+interface Approval {
+    id: string
+    status: string
+    conversation_id: string
+    reason: string
+    user_message?: string
+    tool_call: {
+        id?: string
+        name: string
+        args: Record<string, unknown>
+    }
+    created_at: string
 }
 
 export default function Dashboard() {
@@ -56,6 +69,12 @@ export default function Dashboard() {
     const { data: logs = [] } = useQuery({
         queryKey: ["logs"],
         queryFn: getLogs,
+    })
+
+    const { data: approvals = [] } = useQuery({
+        queryKey: ["approvals", "pending"],
+        queryFn: () => getApprovals("pending"),
+        refetchInterval: 3000,
     })
 
     // ---- MUTATIONS ----
@@ -92,6 +111,22 @@ export default function Dashboard() {
         onSuccess: () => queryClient.invalidateQueries({ queryKey: ["rules"] })
     })
 
+    const approveMutation = useMutation({
+        mutationFn: approveApproval,
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ["approvals"] })
+            queryClient.invalidateQueries({ queryKey: ["logs"] })
+        }
+    })
+
+    const rejectMutation = useMutation({
+        mutationFn: rejectApproval,
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ["approvals"] })
+            queryClient.invalidateQueries({ queryKey: ["logs"] })
+        }
+    })
+
     // ---- HANDLERS ----
     const handleSend = () => {
         if (!input.trim()) return
@@ -103,17 +138,6 @@ export default function Dashboard() {
     const handleAddRule = () => {
         if (!newRule.tool) return
         addRuleMutation.mutate(newRule)
-    }
-
-    // ---- RULE BADGE COLORS ----
-    const ruleColor = (type: string) => {
-        switch (type) {
-            case "block": return "destructive"
-            case "require_approval": return "warning"
-            case "input_validation": return "secondary"
-            case "budget": return "outline"
-            default: return "default"
-        }
     }
 
     return (
@@ -139,7 +163,7 @@ export default function Dashboard() {
                             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#e05a2b] opacity-75"></span>
                             <span className="relative inline-flex rounded-full h-2 w-2 bg-[#e05a2b]"></span>
                         </span>
-                        <span>// POLICY ENGINE ACTIVE</span>
+                        <span>{"// POLICY ENGINE ACTIVE"}</span>
                     </div>
                     <div className="h-4 w-px bg-zinc-800" />
                     <div className="text-[#e05a2b] flex items-center gap-2">
@@ -165,7 +189,7 @@ export default function Dashboard() {
                             <div className="flex-1 overflow-y-auto mb-4 space-y-3 pr-2 min-h-0">
                                 {messages.length === 0 && (
                                     <div className="text-zinc-650 text-center mt-24 space-y-2">
-                                        <p className="font-mono font-bold text-zinc-500">// NO ACTIVE SESSION</p>
+                                        <p className="font-mono font-bold text-zinc-500">{"// NO ACTIVE SESSION"}</p>
                                         <p className="text-[11px] font-sans text-zinc-600">Send a message to initialize the guardrail session...</p>
                                     </div>
                                 )}
@@ -178,8 +202,8 @@ export default function Dashboard() {
                                                     ? "bg-red-950/20 border-red-900/60 text-red-200 font-mono"
                                                     : "bg-[#18181b] border-zinc-800 text-zinc-300 font-sans"
                                         }`}>
-                                            {msg.role === "user" && <div className="text-[9px] text-[#e05a2b] font-mono mb-1 font-bold uppercase tracking-wider">// USER_QUERY</div>}
-                                            {msg.role === "agent" && !msg.blocked && <div className="text-[9px] text-zinc-500 font-mono mb-1 font-bold uppercase tracking-wider">// AGENT_RESPONSE</div>}
+                                            {msg.role === "user" && <div className="text-[9px] text-[#e05a2b] font-mono mb-1 font-bold uppercase tracking-wider">{"// USER_QUERY"}</div>}
+                                            {msg.role === "agent" && !msg.blocked && <div className="text-[9px] text-zinc-500 font-mono mb-1 font-bold uppercase tracking-wider">{"// AGENT_RESPONSE"}</div>}
                                             {msg.blocked && <div className="text-[9px] text-red-400 mb-1 font-bold font-mono tracking-wider">🚫 INTENT_BLOCKED: POLICY_VIOLATION</div>}
                                             <div className="whitespace-pre-wrap leading-relaxed">{msg.content}</div>
                                         </div>
@@ -188,7 +212,7 @@ export default function Dashboard() {
                                 {chatMutation.isPending && (
                                     <div className="flex justify-start">
                                         <div className="bg-[#18181b] border border-zinc-800 text-zinc-500 px-4 py-2.5 text-xs font-mono">
-                                            <span className="inline-block animate-pulse">// AGENT THINKING... SECURING TRANSIT</span>
+                                            <span className="inline-block animate-pulse">{"// AGENT THINKING... SECURING TRANSIT"}</span>
                                         </div>
                                     </div>
                                 )}
@@ -228,7 +252,7 @@ export default function Dashboard() {
                             <div className="flex-1 overflow-y-auto mb-4 space-y-2 pr-2 min-h-0">
                                 {rules.length === 0 && (
                                     <p className="text-zinc-600 text-xs font-mono text-center mt-10">
-                                        // NO ACTIVE POLICIES LOADED
+                                        {"// NO ACTIVE POLICIES LOADED"}
                                     </p>
                                 )}
                                 {rules.map((rule: Rule) => (
@@ -249,9 +273,67 @@ export default function Dashboard() {
                                 ))}
                             </div>
 
+                            {/* Pending Approvals */}
+                            <div className="border-t border-zinc-800 pt-3 mb-3 space-y-2 shrink-0">
+                                <div className="flex items-center justify-between">
+                                    <p className="text-[9px] text-[#e05a2b] font-mono font-semibold uppercase tracking-wider">{"// PENDING APPROVALS"}</p>
+                                    <span className="border border-zinc-800 px-2 py-0.5 text-[9px] text-zinc-500 font-mono">
+                                        {approvals.length}
+                                    </span>
+                                </div>
+                                <div className="max-h-32 overflow-y-auto space-y-2 pr-1">
+                                    {approvals.length === 0 && (
+                                        <p className="text-zinc-600 text-[10px] font-mono py-2">
+                                            {"// NO ACTIONS WAITING"}
+                                        </p>
+                                    )}
+                                    {approvals.map((approval: Approval) => (
+                                        <div key={approval.id} className="bg-[#18181b] border border-zinc-800/60 px-3 py-2">
+                                            <div className="flex items-start justify-between gap-3">
+                                                <div className="min-w-0">
+                                                    <div className="flex items-center gap-2 min-w-0">
+                                                        <span className="text-[9px] text-amber-400 border border-amber-950 bg-amber-950/10 px-1.5 py-0.5 font-mono">
+                                                            PENDING
+                                                        </span>
+                                                        <span className="text-xs font-mono font-bold text-zinc-300 truncate">
+                                                            {approval.tool_call.name}
+                                                        </span>
+                                                    </div>
+                                                    <p className="text-[10px] text-zinc-500 font-mono mt-1 truncate">
+                                                        {approval.reason}
+                                                    </p>
+                                                </div>
+                                                <div className="flex items-center gap-1 shrink-0">
+                                                    <Button
+                                                        variant="ghost"
+                                                        size="sm"
+                                                        onClick={() => approveMutation.mutate(approval.id)}
+                                                        disabled={approveMutation.isPending || rejectMutation.isPending}
+                                                        className="text-green-400 hover:text-green-300 hover:bg-green-950/20 rounded-none h-7 w-7 p-0"
+                                                        title="Approve request"
+                                                    >
+                                                        <Check className="w-3.5 h-3.5" />
+                                                    </Button>
+                                                    <Button
+                                                        variant="ghost"
+                                                        size="sm"
+                                                        onClick={() => rejectMutation.mutate(approval.id)}
+                                                        disabled={approveMutation.isPending || rejectMutation.isPending}
+                                                        className="text-red-400 hover:text-red-300 hover:bg-red-950/20 rounded-none h-7 w-7 p-0"
+                                                        title="Reject request"
+                                                    >
+                                                        <X className="w-3.5 h-3.5" />
+                                                    </Button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+
                             {/* Add New Rule */}
                             <div className="border-t border-zinc-800 pt-3 space-y-2 shrink-0">
-                                <p className="text-[9px] text-[#e05a2b] font-mono font-semibold uppercase tracking-wider">// DEFINE NEW POLICY RULE</p>
+                                <p className="text-[9px] text-[#e05a2b] font-mono font-semibold uppercase tracking-wider">{"// DEFINE NEW POLICY RULE"}</p>
                                 <div className="flex gap-2">
                                     <select
                                         value={newRule.type}
@@ -308,7 +390,7 @@ export default function Dashboard() {
                         <div className="space-y-2">
                             {logs.length === 0 && (
                                 <p className="text-zinc-650 text-xs font-mono text-center py-8">
-                                    // NO OPERATIONS REGISTERED YET
+                                    {"// NO OPERATIONS REGISTERED YET"}
                                 </p>
                             )}
                             {logs.map((log: Log, i: number) => (
